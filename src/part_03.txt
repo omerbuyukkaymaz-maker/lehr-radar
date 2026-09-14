@@ -1,0 +1,320 @@
+	text(hdc, r, label, fg, f, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+}
+
+func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+	switch msg {
+	case WM_DESTROY:
+		pPostQuitMessage.Call(0)
+		return 0
+	case WM_PAINT:
+		paint(hwnd)
+		return 0
+	case WM_ERASEBKGND:
+		// We draw the full client area into a backbuffer; skipping background erase
+		// avoids redundant work and visible stalls/flicker on resize.
+		return 1
+	case WM_SIZE:
+		invalidate()
+		return 0
+	case WM_LBUTTONDOWN:
+		handleClick(loWord(lParam), hiWord(lParam))
+		return 0
+	case WM_MOUSEWHEEL:
+		delta := hiWord(wParam)
+		if delta > 0 {
+			offsets[activeTab] -= 3
+		} else {
+			offsets[activeTab] += 3
+		}
+		if offsets[activeTab] < 0 {
+			offsets[activeTab] = 0
+		}
+		invalidate()
+		return 0
+	case WM_KEYDOWN:
+		if wParam == VK_UP {
+			offsets[activeTab]--
+			if offsets[activeTab] < 0 {
+				offsets[activeTab] = 0
+			}
+			invalidate()
+		}
+		if wParam == VK_DOWN {
+			offsets[activeTab]++
+			invalidate()
+		}
+		if wParam == VK_PRIOR {
+			offsets[activeTab] -= 8
+			if offsets[activeTab] < 0 {
+				offsets[activeTab] = 0
+			}
+			invalidate()
+		}
+		if wParam == VK_NEXT {
+			offsets[activeTab] += 8
+			invalidate()
+		}
+		return 0
+	case WM_TIMER:
+		if wParam == 1 {
+			startSync(false)
+		}
+		if wParam == 2 {
+			invalidate()
+		}
+		if wParam == 3 {
+			checkForUpdate(false)
+		}
+		if wParam == 4 {
+			refreshMarket(false)
+		}
+		return 0
+	case WM_APP_CLEAR_PRESSED:
+		stateMu.Lock()
+		pressedName = ""
+		stateMu.Unlock()
+		invalidate()
+		return 0
+	case WM_APP_ROUTE_DONE:
+		invalidate()
+		return 0
+	case WM_APP_TILE_DONE:
+		invalidate()
+		return 0
+	case WM_APP_UPDATE_DONE:
+		invalidate()
+		return 0
+	case WM_APP_MARKET_DONE:
+		invalidate()
+		return 0
+	case WM_APP_SYNC_DONE:
+		stateMu.Lock()
+		syncBusy = false
+		stateMu.Unlock()
+		invalidate()
+		return 0
+	case WM_APP_OAUTH_DONE:
+		stateMu.Lock()
+		oauthBusy = false
+		stateMu.Unlock()
+		invalidate()
+		return 0
+	}
+	r, _, _ := pDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
+	return r
+}
+
+func paint(hwnd uintptr) {
+	var ps PAINTSTRUCT
+	screenHdc, _, _ := pBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+	defer pEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+	var rc RECT
+	pGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
+	W, H := rc.Right, rc.Bottom
+	if W <= 0 || H <= 0 {
+		return
+	}
+	memDC := ensureBackbuffer(screenHdc, W, H)
+	paintScene(memDC, W, H)
+	pBitBlt.Call(screenHdc, 0, 0, uintptr(W), uintptr(H), memDC, 0, 0, SRCCOPY)
+}
+
+func paintScene(hdc uintptr, W, H int32) {
+	fill(hdc, RECT{0, 0, W, H}, rgb(8, 13, 25))
+	hits = nil
+	fill(hdc, RECT{0, 0, W, 82}, rgb(12, 20, 38))
+	text(hdc, RECT{28, 12, 360, 48}, "LEHR RADAR", rgb(241, 245, 249), fontTitle, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	text(hdc, RECT{29, 46, 720, 70}, "Automobil-Fachmann EFZ · Kanton Aargau · Lehrbeginn 2027", rgb(148, 163, 184), fontSub, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+
+	dataMu.RLock()
+	marketChecked := current.Meta.MarketLastChecked
+	homeAddr := current.Home.Address
+	dataMu.RUnlock()
+	if marketChecked == "" {
+		marketChecked = "—"
+	}
+	fresh := fmt.Sprintf("v%s  ·  %s  ·  Lehrstellen: %s", appVersion, time.Now().Format("02.01.2006 15:04"), marketChecked)
+	text(hdc, RECT{W - 610, 58, W - 28, 78}, fresh, rgb(100, 116, 139), fontSmall, DT_RIGHT|DT_VCENTER|DT_SINGLELINE)
+
+	stateMu.Lock()
+	sb := syncBusy
+	ob := oauthBusy
+	ls := lastSyncText
+	sl := statusLine
+	alert := lastAlert
+	alertActive := alert != "" && time.Now().Before(alertUntil)
+	stateMu.Unlock()
+	bx := W - 568
+	stateMu.Lock()
+	ub := updateBusy
+	stateMu.Unlock()
+	updateLabel := "Güncelle"
+	if ub {
+		updateLabel = "Kontrol..."
+	}
+	addButton(hdc, RECT{bx, 18, bx + 128, 56}, updateLabel, "update", rgb(49, 46, 129), rgb(255, 255, 255), fontTab)
+	addButton(hdc, RECT{bx + 140, 18, bx + 292, 56}, func() string {
+		if sb {
+			return "Senkronize..."
+		}
+		return "↻ Gmail Yenile"
+	}(), "sync", rgb(37, 99, 235), rgb(255, 255, 255), fontTab)
+	gmailLabel := "Gmail Bağla"
+	if tokenExists() {
+		gmailLabel = "Gmail Bağlı ✓"
+	}
+	if ob {
+		gmailLabel = "Bağlanıyor..."
+	}
+	addButton(hdc, RECT{bx + 304, 18, bx + 540, 56}, gmailLabel, "gmail", rgb(30, 41, 59), rgb(226, 232, 240), fontTab)
+
+	tabs := []string{"Özet", "Başvurular", "Redler", "Başvurmadıklar", "Harita / Mesafe", "Ayarlar"}
+	widths := []int32{92, 112, 86, 150, 146, 92}
+	x := int32(28)
+	y := int32(94)
+	for i, t := range tabs {
+		tw := widths[i]
+		r := RECT{x, y, x + tw, y + 36}
+		if i == activeTab {
+			fill(hdc, r, rgb(30, 64, 175))
+			text(hdc, r, t, rgb(255, 255, 255), fontTab, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+		} else {
+			text(hdc, r, t, rgb(148, 163, 184), fontTab, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+		}
+		hits = append(hits, RectHit{fmt.Sprintf("tab:%d", i), r, ""})
+		x += tw + 8
+	}
+	line(hdc, 28, 136, W-28, 136, rgb(30, 41, 59))
+
+	if alertActive {
+		r := RECT{W - 440, 92, W - 28, 132}
+		fill(hdc, r, rgb(22, 78, 63))
+		text(hdc, RECT{r.Left + 12, r.Top, r.Right - 12, r.Bottom}, alert, rgb(220, 252, 231), fontSmall, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+	}
+
+	switch activeTab {
+	case 0:
+		drawDashboard(hdc, W, H, fontBold, fontBody, fontSmall)
+	case 1:
+		drawApplications(hdc, W, H, fontBold, fontBody, fontSmall, false)
+	case 2:
+		drawApplications(hdc, W, H, fontBold, fontBody, fontSmall, true)
+	case 3:
+		drawMarket(hdc, W, H, fontBold, fontBody, fontSmall)
+	case 4:
+		drawDistanceTab(hdc, W, H, fontBold, fontBody, fontSmall)
+	case 5:
+		drawSettings(hdc, W, H, fontBold, fontBody, fontSmall)
+	}
+
+	if strings.TrimSpace(homeAddr) == "" {
+		homeAddr = "ayarlanmamış"
+	}
+	status := fmt.Sprintf("Durum: %s  ·  %s  ·  Ev: %s", sl, ls, homeAddr)
+	text(hdc, RECT{28, H - 34, W - 28, H - 10}, status, rgb(100, 116, 139), fontSmall, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+}
+
+func darken(c uintptr, amount byte) uintptr {
+	r := byte(c & 0xff)
+	g := byte((c >> 8) & 0xff)
+	b := byte((c >> 16) & 0xff)
+	if r > amount {
+		r -= amount
+	} else {
+		r = 0
+	}
+	if g > amount {
+		g -= amount
+	} else {
+		g = 0
+	}
+	if b > amount {
+		b -= amount
+	} else {
+		b = 0
+	}
+	return rgb(r, g, b)
+}
+
+func addButton(hdc uintptr, r RECT, label, name string, bg, fg uintptr, font uintptr) {
+	stateMu.Lock()
+	pressed := pressedName == name
+	stateMu.Unlock()
+	original := r
+	if pressed {
+		bg = darken(bg, 38)
+		r.Top += 2
+		r.Bottom += 2
+	}
+	fill(hdc, r, bg)
+	border := rgb(71, 85, 105)
+	if pressed {
+		border = rgb(147, 197, 253)
+	}
+	line(hdc, r.Left, r.Top, r.Right, r.Top, border)
+	line(hdc, r.Left, r.Bottom-1, r.Right, r.Bottom-1, border)
+	line(hdc, r.Left, r.Top, r.Left, r.Bottom, border)
+	line(hdc, r.Right-1, r.Top, r.Right-1, r.Bottom, border)
+	text(hdc, r, label, fg, font, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	hits = append(hits, RectHit{name, original, ""})
+}
+
+func showPress(name string) {
+	stateMu.Lock()
+	pressedName = name
+	stateMu.Unlock()
+	invalidate()
+	time.AfterFunc(160*time.Millisecond, func() { pPostMessageW.Call(hwndMain, WM_APP_CLEAR_PRESSED, 0, 0) })
+}
+
+func drawDashboard(hdc uintptr, W, H int32, boldF, bodyF, smallF uintptr) {
+	applied := 0
+	rejected := 0
+	reviewing := 0
+	positive := 0
+	waiting := 0
+	dataMu.RLock()
+	for _, a := range current.Applications {
+		applied++
+		switch a.Status {
+		case "rejected":
+			rejected++
+		case "reviewing":
+			reviewing++
+		case "positive":
+			positive++
+		default:
+			waiting++
+		}
+	}
+	dataMu.RUnlock()
+	market := len(unappliedMarkets())
+	cards := []struct {
+		label string
+		n     int
+		bg    uintptr
+	}{{"Toplam başvuru", applied, rgb(30, 41, 59)}, {"Bekleyen", waiting, rgb(30, 58, 82)}, {"İnceleniyor", reviewing, rgb(80, 60, 20)}, {"Red", rejected, rgb(90, 28, 38)}, {"Olumlu", positive, rgb(22, 75, 55)}, {"Başvurmadığın", market, rgb(49, 46, 129)}}
+	x := int32(28)
+	y := int32(154)
+	gap := int32(12)
+	cw := (W - 56 - gap*5) / 6
+	if cw < 145 {
+		cw = 145
+	}
+	bigF := fontBig
+	for _, c := range cards {
+		r := RECT{x, y, x + cw, y + 92}
+		fill(hdc, r, c.bg)
+		text(hdc, RECT{x + 14, y + 12, x + cw - 10, y + 38}, c.label, rgb(203, 213, 225), smallF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+		text(hdc, RECT{x + 14, y + 39, x + cw - 10, y + 78}, strconv.Itoa(c.n), rgb(255, 255, 255), bigF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+		x += cw + gap
+	}
+	text(hdc, RECT{28, 267, W - 28, 296}, "Son başvurular", rgb(226, 232, 240), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	dataMu.RLock()
+	apps := append([]Application(nil), current.Applications...)
+	dataMu.RUnlock()
+	sort.Slice(apps, func(i, j int) bool { return apps[i].AppliedDate > apps[j].AppliedDate })
+	if len(apps) > 8 {
+		apps = apps[:8]
+	}
+	drawAppRows(hdc, apps, 306, W, H, boldF, bodyF, smallF)
