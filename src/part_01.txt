@@ -1,0 +1,320 @@
+
+func appDir() string {
+	base := os.Getenv("APPDATA")
+	if base == "" {
+		base, _ = os.UserConfigDir()
+	}
+	return filepath.Join(base, "LehrRadar")
+}
+
+func initFiles() error {
+	appDataDir = appDir()
+	dataPath = filepath.Join(appDataDir, "data.json")
+	oauthPath = filepath.Join(appDataDir, "gmail-oauth.json")
+	tokenPath = filepath.Join(appDataDir, "gmail-token.json")
+	setupPath = filepath.Join(appDataDir, "GMAIL_KURULUM.txt")
+	routeCachePath = filepath.Join(appDataDir, "route-cache.json")
+	tileCacheDir = filepath.Join(appDataDir, "mapcache")
+	if err := os.MkdirAll(tileCacheDir, 0755); err != nil {
+		return err
+	}
+	if _, err := os.Stat(dataPath); os.IsNotExist(err) {
+		b, _ := embeddedFS.ReadFile("seed.json")
+		_ = os.WriteFile(dataPath, b, 0644)
+	}
+	if _, err := os.Stat(setupPath); os.IsNotExist(err) {
+		_ = os.WriteFile(setupPath, []byte(gmailSetupText), 0644)
+	}
+	if err := loadData(); err != nil {
+		return err
+	}
+	if migrateData() {
+		if err := saveData(); err != nil {
+			return err
+		}
+	}
+	loadRouteCache()
+	return nil
+}
+
+func loadData() error {
+	b, err := os.ReadFile(dataPath)
+	if err != nil {
+		return err
+	}
+	var d Data
+	if err = json.Unmarshal(b, &d); err != nil {
+		return err
+	}
+	dataMu.Lock()
+	current = d
+	dataMu.Unlock()
+	return nil
+}
+
+func migrateData() bool {
+	changed := false
+	dataMu.Lock()
+	upgrading := current.Meta.Version != appVersion
+	defer dataMu.Unlock()
+	if current.Home.Address == "" {
+		current.Home = Home{Name: "Ev", Address: ""}
+		changed = true
+	}
+	if current.Meta.Version != appVersion {
+		current.Meta.Version = appVersion
+		changed = true
+	}
+	if current.Meta.GmailLastSyncUnix == 0 {
+		current.Meta.GmailLastSyncUnix = time.Now().Add(-7 * 24 * time.Hour).Unix()
+		changed = true
+	}
+	if current.Meta.Profession == "" {
+		current.Meta.Profession = "Automobil-Fachmann EFZ"
+		changed = true
+	}
+	if current.Meta.Canton == "" {
+		current.Meta.Canton = "AG"
+		changed = true
+	}
+	if upgrading {
+		if b, err := embeddedFS.ReadFile("seed.json"); err == nil {
+			var seed Data
+			if json.Unmarshal(b, &seed) == nil && len(seed.Market) > 0 {
+				idx := map[string]int{}
+				for i := range current.Market {
+					idx[current.Market[i].ID] = i
+				}
+				for _, m := range seed.Market {
+					if i, ok := idx[m.ID]; ok {
+						current.Market[i] = m
+					} else {
+						current.Market = append(current.Market, m)
+					}
+				}
+				current.Meta.MarketLastChecked = seed.Meta.MarketLastChecked
+				changed = true
+			}
+		}
+	}
+	addresses := map[string]string{
+		"amag-schinznach":    "Aarauerstrasse 22, 5116 Schinznach-Bad, Schweiz",
+		"emil-frey-safenwil": "Emil Frey Strasse, 5745 Safenwil, Schweiz",
+		"kennys-wettingen":   "Landstrasse 189, 5430 Wettingen, Schweiz",
+		"autohaus-kueng":     "Im Halt 2, 5412 Gebenstorf, Schweiz",
+		"garage-kueng":       "Landstrasse 53, 5412 Gebenstorf, Schweiz",
+		"autocenter-kueng":   "Landstrasse 148, 5430 Wettingen, Schweiz",
+		"feldgarage-seengen": "Egliswilerstrasse 35, 5707 Seengen, Schweiz",
+		"auto-meier":         "Hauptstrasse 253, 5314 Kleindöttingen, Schweiz",
+		"garage-ruetter":     "Mettenfeldring 8, 5642 Mühlau, Schweiz",
+		"rh-auto-service":    "Aarauerstrasse 35, 5600 Lenzburg, Schweiz",
+		"haller-zofingen":    "Untere Brühlstrasse 33, 4800 Zofingen, Schweiz",
+		"walter-hasler":      "Schützenweg 4, 5070 Frick, Schweiz",
+		"garage-pinar":       "Wartburgstrasse 2, 4663 Aarburg, Schweiz",
+		"auto-schneider":     "Kuhgässlistrasse 1, 5303 Würenlingen, Schweiz",
+		"bestdrive":          "Neulandweg 6, 5502 Hunzenschwil, Schweiz",
+		"tinner":             "Bruggerstrasse 152, 5400 Baden, Schweiz",
+		"sepp-suter":         "Oberdorf 15, 5637 Beinwil (Freiamt), Schweiz",
+		"hedin-wohlen":       "Schützenmattweg 20, 5610 Wohlen, Schweiz",
+		"wyser-seon":         "Breitenweg 19, 5703 Seon, Schweiz",
+		"carplanet-aarburg":  "Oltnerstrasse 101, 4663 Aarburg, Schweiz",
+	}
+	for i := range current.Applications {
+		if current.Applications[i].Address == "" {
+			if a := addresses[current.Applications[i].ID]; a != "" {
+				current.Applications[i].Address = a
+				changed = true
+			}
+		}
+	}
+	marketAddr := map[string]string{
+		"gross-garage-wohlen": "Wohlen AG, Schweiz", "gross-garage-wettingen": "Wettingen, Schweiz",
+		"auto-technik-aarau": "Aarau, Schweiz", "autohaus-tivoli": "Spreitenbach, Schweiz",
+		"garage-rinau": "Kaiseraugst, Schweiz", "garage-gut": "Meisterschwanden, Schweiz",
+		"gebr-knecht": "Windisch, Schweiz", "iveco-hendschiken": "Hendschiken, Schweiz",
+		"scania-murgenthal": "Murgenthal, Schweiz", "merbag-wettingen-nf": "Wettingen, Schweiz",
+		"merbag-aarau-rohr": "Aarau Rohr, Schweiz", "dreier-oberentfelden": "Oberentfelden, Schweiz",
+	}
+	for i := range current.Market {
+		if current.Market[i].Address == "" {
+			if a := marketAddr[current.Market[i].ID]; a != "" {
+				current.Market[i].Address = a
+				changed = true
+			}
+		}
+	}
+	found := false
+	for _, m := range current.Market {
+		if m.ID == "lancarauto-arni" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		current.Market = append(current.Market, Market{ID: "lancarauto-arni", Company: "Lancarauto GmbH", Location: "Arni", Address: "Arni AG, Schweiz", Direction: "Automobil-Fachmann EFZ Personenwagen", Year: 2027, Availability: "unknown", SourceURL: "https://www.yousty.ch/de-CH/lehrstellen/AG/34302-automobil-fachmann-frau-efz-personenwagen", Note: "Lehrbetrieb; 2027 durumu henüz net değil."})
+		changed = true
+	}
+	return changed
+}
+
+func saveData() error {
+	dataMu.RLock()
+	b, err := json.MarshalIndent(current, "", "  ")
+	dataMu.RUnlock()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dataPath, b, 0644)
+}
+
+func loadRouteCache() {
+	b, err := os.ReadFile(routeCachePath)
+	if err != nil {
+		return
+	}
+	var m map[string]RouteInfo
+	if json.Unmarshal(b, &m) == nil {
+		routeMu.Lock()
+		for k, v := range m {
+			routeCache[k] = v
+		}
+		routeMu.Unlock()
+	}
+}
+
+func saveRouteCache() {
+	routeMu.Lock()
+	copyMap := make(map[string]RouteInfo, len(routeCache))
+	for k, v := range routeCache {
+		copyMap[k] = v
+	}
+	routeMu.Unlock()
+	b, _ := json.MarshalIndent(copyMap, "", "  ")
+	_ = os.WriteFile(routeCachePath, b, 0644)
+}
+
+func initGDIPlus() {
+	in := GdiplusStartupInput{GdiplusVersion: 1}
+	pGdiplusStartup.Call(uintptr(unsafe.Pointer(&gdipToken)), uintptr(unsafe.Pointer(&in)), 0)
+}
+
+func shutdownGDIPlus() {
+	tileMu.Lock()
+	for _, img := range tileImages {
+		if img != 0 {
+			pGdipDisposeImage.Call(img)
+		}
+	}
+	tileImages = map[string]uintptr{}
+	tileMu.Unlock()
+	if gdipToken != 0 {
+		pGdiplusShutdown.Call(gdipToken)
+		gdipToken = 0
+	}
+}
+
+func cleanupBackbuffer() {
+	if backDC != 0 {
+		if backOld != 0 {
+			pSelectObject.Call(backDC, backOld)
+		}
+		if backBmp != 0 {
+			pDeleteObject.Call(backBmp)
+		}
+		pDeleteDC.Call(backDC)
+	}
+	backDC, backBmp, backOld = 0, 0, 0
+	backW, backH = 0, 0
+}
+
+func ensureBackbuffer(screenHdc uintptr, w, h int32) uintptr {
+	if backDC != 0 && backW == w && backH == h {
+		return backDC
+	}
+	cleanupBackbuffer()
+	backDC, _, _ = pCreateCompatibleDC.Call(screenHdc)
+	backBmp, _, _ = pCreateCompatibleBitmap.Call(screenHdc, uintptr(w), uintptr(h))
+	backOld, _, _ = pSelectObject.Call(backDC, backBmp)
+	backW, backH = w, h
+	return backDC
+}
+
+func installedExePath() string {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		base, _ = os.UserConfigDir()
+	}
+	return filepath.Join(base, "LehrRadar", "Lehr_Radar.exe")
+}
+
+func psQuote(s string) string { return strings.ReplaceAll(s, "'", "''") }
+
+func createDesktopShortcut(target string) {
+	name := "Lehr Radar.lnk"
+	cmd := fmt.Sprintf(`$ws=New-Object -ComObject WScript.Shell; $d=[Environment]::GetFolderPath('Desktop'); $s=$ws.CreateShortcut((Join-Path $d '%s')); $s.TargetPath='%s'; $s.WorkingDirectory='%s'; $s.Description='Lehr Radar - Lehrstellen Tracker'; $s.Save()`, psQuote(name), psQuote(target), psQuote(filepath.Dir(target)))
+	_ = exec.Command("powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-Command", cmd).Run()
+}
+
+// ensureInstalled makes the app a one-time install: after the first launch, a stable
+// copy lives under LocalAppData and future versions can replace that copy in place.
+func ensureInstalled() bool {
+	exe, err := os.Executable()
+	if err != nil {
+		return true
+	}
+	exe, _ = filepath.Abs(exe)
+	dst := installedExePath()
+	dstAbs, _ := filepath.Abs(dst)
+	if strings.EqualFold(exe, dstAbs) {
+		return true
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return true
+	}
+	in, err := os.Open(exe)
+	if err != nil {
+		return true
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return true
+	}
+	_, cpErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if cpErr != nil || closeErr != nil {
+		return true
+	}
+	createDesktopShortcut(dst)
+	_ = exec.Command(dst).Start()
+	return false
+}
+
+func versionParts(v string) []int {
+	v = strings.TrimSpace(strings.TrimPrefix(v, "v"))
+	ss := strings.Split(v, ".")
+	out := make([]int, 3)
+	for i := 0; i < len(out) && i < len(ss); i++ {
+		n := strings.SplitN(ss[i], "-", 2)[0]
+		out[i], _ = strconv.Atoi(n)
+	}
+	return out
+}
+
+func versionGreater(a, b string) bool {
+	aa, bb := versionParts(a), versionParts(b)
+	for i := 0; i < 3; i++ {
+		if aa[i] != bb[i] {
+			return aa[i] > bb[i]
+		}
+	}
+	return false
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
