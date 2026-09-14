@@ -1,0 +1,6 @@
+{
+  "version": "1.3.0",
+  "url": "https://raw.githubusercontent.com/omerbuyukkaymaz-maker/lehr-radar/main/Lehr_Radar.exe",
+  "sha256": "fe592d13f603ad8cddc8b49a52a1c99abbb7c7a120431482d5475154c66bb9ee",
+  "notes": "v1.3: stability optimization, lightweight map, lower background concurrency, clearer button feedback, Gmail status sound/flash notifications and live self-update channel."
+}
