@@ -1,0 +1,320 @@
+	if _, err = io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+func downloadTo(u, path string) error {
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", "LehrRadar/"+appVersion)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	tmp := path + ".part"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(f, resp.Body)
+	cerr := f.Close()
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if cerr != nil {
+		_ = os.Remove(tmp)
+		return cerr
+	}
+	return os.Rename(tmp, path)
+}
+
+func launchUpdater(newExe, target string) error {
+	pid := os.Getpid()
+	scriptPath := filepath.Join(os.TempDir(), fmt.Sprintf("lehr-radar-update-%d.cmd", time.Now().UnixNano()))
+	script := fmt.Sprintf(`@echo off
+set "PID=%d"
+:wait
+tasklist /FI "PID eq %%PID%%" 2>NUL | find "%%PID%%" >NUL
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >NUL
+  goto wait
+)
+copy /Y "%s" "%s" >NUL
+del /Q "%s" >NUL 2>NUL
+start "" "%s"
+del /Q "%%~f0" >NUL 2>NUL
+`, pid, newExe, target, newExe, target)
+	if err := os.WriteFile(scriptPath, []byte(script), 0644); err != nil {
+		return err
+	}
+	cmd := exec.Command("cmd.exe", "/C", scriptPath)
+	return cmd.Start()
+}
+
+func checkForUpdate(userTriggered bool) {
+	stateMu.Lock()
+	if updateBusy {
+		stateMu.Unlock()
+		return
+	}
+	updateBusy = true
+	updateStatus = "Güncelleme kontrol ediliyor..."
+	stateMu.Unlock()
+	invalidate()
+	go func() {
+		defer func() {
+			stateMu.Lock()
+			updateBusy = false
+			stateMu.Unlock()
+			pPostMessageW.Call(hwndMain, WM_APP_UPDATE_DONE, 0, 0)
+		}()
+		req, _ := http.NewRequest("GET", updateManifestURL+"?t="+strconv.FormatInt(time.Now().Unix(), 10), nil)
+		req.Header.Set("User-Agent", "LehrRadar/"+appVersion)
+		resp, err := (&http.Client{Timeout: 7 * time.Second}).Do(req)
+		if err != nil {
+			stateMu.Lock()
+			updateStatus = "Güncelleme sunucusuna ulaşılamadı"
+			stateMu.Unlock()
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == 404 {
+			stateMu.Lock()
+			updateStatus = "Otomatik güncelleme kanalı hazırlanıyor"
+			stateMu.Unlock()
+			return
+		}
+		if resp.StatusCode >= 300 {
+			stateMu.Lock()
+			updateStatus = fmt.Sprintf("Güncelleme kontrolü: HTTP %d", resp.StatusCode)
+			stateMu.Unlock()
+			return
+		}
+		var m UpdateManifest
+		if json.NewDecoder(resp.Body).Decode(&m) != nil || m.Version == "" || m.URL == "" {
+			stateMu.Lock()
+			updateStatus = "Güncelleme manifesti geçersiz"
+			stateMu.Unlock()
+			return
+		}
+		if !versionGreater(m.Version, appVersion) {
+			stateMu.Lock()
+			updateStatus = "Güncel · v" + appVersion
+			stateMu.Unlock()
+			return
+		}
+		newPath := filepath.Join(os.TempDir(), "Lehr_Radar_"+strings.ReplaceAll(m.Version, ".", "_")+".exe")
+		stateMu.Lock()
+		updateStatus = "v" + m.Version + " indiriliyor..."
+		stateMu.Unlock()
+		invalidate()
+		if err := downloadTo(m.URL, newPath); err != nil {
+			stateMu.Lock()
+			updateStatus = "Güncelleme indirilemedi: " + err.Error()
+			stateMu.Unlock()
+			return
+		}
+		if strings.TrimSpace(m.SHA256) != "" {
+			h, err := fileSHA256(newPath)
+			if err != nil || !strings.EqualFold(h, strings.TrimSpace(m.SHA256)) {
+				_ = os.Remove(newPath)
+				stateMu.Lock()
+				updateStatus = "Güncelleme doğrulaması başarısız"
+				stateMu.Unlock()
+				return
+			}
+		}
+		target := installedExePath()
+		stateMu.Lock()
+		updateStatus = "v" + m.Version + " hazır · yeniden başlatılıyor"
+		lastAlert = "Yeni sürüm v" + m.Version + " kuruluyor"
+		alertUntil = time.Now().Add(8 * time.Second)
+		stateMu.Unlock()
+		notifyUser()
+		time.Sleep(900 * time.Millisecond)
+		if err := launchUpdater(newPath, target); err != nil {
+			stateMu.Lock()
+			updateStatus = "Güncelleme kurulamadı: " + err.Error()
+			stateMu.Unlock()
+			return
+		}
+		pPostMessageW.Call(hwndMain, WM_CLOSE, 0, 0)
+	}()
+}
+
+func refreshMarket(userTriggered bool) {
+	stateMu.Lock()
+	if marketBusy {
+		stateMu.Unlock()
+		return
+	}
+	marketBusy = true
+	marketStatus = "Lehrstellen güncelleniyor..."
+	stateMu.Unlock()
+	invalidate()
+	go func() {
+		defer func() {
+			stateMu.Lock()
+			marketBusy = false
+			stateMu.Unlock()
+			pPostMessageW.Call(hwndMain, WM_APP_MARKET_DONE, 0, 0)
+		}()
+		req, _ := http.NewRequest("GET", marketDataURL+"?t="+strconv.FormatInt(time.Now().Unix(), 10), nil)
+		req.Header.Set("User-Agent", "LehrRadar/"+appVersion)
+		resp, err := (&http.Client{Timeout: 7 * time.Second}).Do(req)
+		if err != nil {
+			stateMu.Lock()
+			marketStatus = "Canlı Lehrstellen kaynağına ulaşılamadı"
+			stateMu.Unlock()
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == 404 {
+			stateMu.Lock()
+			marketStatus = "Canlı Lehrstellen kanalı hazırlanıyor"
+			stateMu.Unlock()
+			return
+		}
+		if resp.StatusCode >= 300 {
+			stateMu.Lock()
+			marketStatus = fmt.Sprintf("Lehrstellen kontrolü: HTTP %d", resp.StatusCode)
+			stateMu.Unlock()
+			return
+		}
+		var mk []Market
+		if err := json.NewDecoder(resp.Body).Decode(&mk); err != nil || len(mk) == 0 {
+			stateMu.Lock()
+			marketStatus = "Canlı Lehrstellen verisi geçersiz"
+			stateMu.Unlock()
+			return
+		}
+		dataMu.Lock()
+		current.Market = mk
+		current.Meta.MarketLastChecked = time.Now().Format("2006-01-02 15:04")
+		dataMu.Unlock()
+		_ = saveData()
+		stateMu.Lock()
+		marketStatus = fmt.Sprintf("Canlı · %d Lehrbetrieb", len(mk))
+		statusLine = "Lehrstellen listesi güncellendi"
+		stateMu.Unlock()
+		if userTriggered {
+			notifyUser()
+		}
+	}()
+}
+
+func notifyUser() {
+	pMessageBeep.Call(MB_ICONINFORMATION)
+	if hwndMain != 0 {
+		f := FLASHWINFO{CbSize: uint32(unsafe.Sizeof(FLASHWINFO{})), Hwnd: hwndMain, DwFlags: FLASHW_ALL | FLASHW_TIMERNOFG, UCount: 5}
+		pFlashWindowEx.Call(uintptr(unsafe.Pointer(&f)))
+	}
+}
+
+func messageBox(title, text string, icon uintptr) {
+	pMessageBoxW.Call(hwndMain, uintptr(unsafe.Pointer(wstr(text))), uintptr(unsafe.Pointer(wstr(title))), MB_OK|icon)
+}
+func invalidate() { pInvalidateRect.Call(hwndMain, 0, 1) }
+func openExternal(target string) {
+	pShellExecuteW.Call(0, uintptr(unsafe.Pointer(wstr("open"))), uintptr(unsafe.Pointer(wstr(target))), 0, 0, 1)
+}
+func openFolder(path string) { openExternal(path) }
+
+func createFont(size int32, weight int32) uintptr {
+	r, _, _ := pCreateFontW.Call(uintptr(-size), 0, 0, 0, uintptr(weight), 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(wstr("Segoe UI"))))
+	return r
+}
+func initFonts() {
+	fontTitle = createFont(28, FW_BOLD)
+	fontSub = createFont(14, FW_NORMAL)
+	fontTab = createFont(14, FW_SEMIBOLD)
+	fontBody = createFont(14, FW_NORMAL)
+	fontBold = createFont(14, FW_SEMIBOLD)
+	fontSmall = createFont(12, FW_NORMAL)
+	fontBig = createFont(26, FW_BOLD)
+}
+func brush(c uintptr) uintptr {
+	if b := brushCache[c]; b != 0 {
+		return b
+	}
+	r, _, _ := pCreateSolidBrush.Call(c)
+	brushCache[c] = r
+	return r
+}
+func fill(hdc uintptr, r RECT, c uintptr) {
+	pFillRect.Call(hdc, uintptr(unsafe.Pointer(&r)), brush(c))
+}
+func text(hdc uintptr, r RECT, s string, c uintptr, font uintptr, flags uintptr) {
+	old, _, _ := pSelectObject.Call(hdc, font)
+	pSetTextColor.Call(hdc, c)
+	pSetBkMode.Call(hdc, TRANSPARENT)
+	pDrawTextW.Call(hdc, uintptr(unsafe.Pointer(wstr(s))), uintptr(0xffffffff), uintptr(unsafe.Pointer(&r)), flags)
+	pSelectObject.Call(hdc, old)
+}
+func line(hdc uintptr, x1, y1, x2, y2 int32, c uintptr) {
+	pen := penCache[c]
+	if pen == 0 {
+		pen, _, _ = pCreatePen.Call(PS_SOLID, 1, c)
+		penCache[c] = pen
+	}
+	old, _, _ := pSelectObject.Call(hdc, pen)
+	pMoveToEx.Call(hdc, uintptr(x1), uintptr(y1), 0)
+	pLineTo.Call(hdc, uintptr(x2), uintptr(y2))
+	pSelectObject.Call(hdc, old)
+}
+
+func countStatus(st string) int {
+	dataMu.RLock()
+	defer dataMu.RUnlock()
+	n := 0
+	for _, a := range current.Applications {
+		if a.Status == st {
+			n++
+		}
+	}
+	return n
+}
+func unappliedMarkets() []Market {
+	dataMu.RLock()
+	defer dataMu.RUnlock()
+	var out []Market
+	for _, m := range current.Market {
+		if !isMarketAppliedLocked(m) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+var normalizeRe = regexp.MustCompile(`[^a-z0-9äöüß]+`)
+var rejectRe = regexp.MustCompile(`absage|abgelehnt|leider.{0,80}nicht|anderen bewerber|nicht in die engere|nicht weiter`)
+var positiveRe = regexp.MustCompile(`schnupper|einladung|vorstellungsgespräch|gespräch|termin|kennenlernen|probearbeit`)
+var reviewingRe = regexp.MustCompile(`erhalten|eingangsbestätigung|prüfen|geprüft|geduld|bearbeit`)
+
+func normalize(s string) string {
+	s = strings.ToLower(s)
+	s = normalizeRe.ReplaceAllString(s, " ")
+	return strings.TrimSpace(s)
+}
+func isMarketAppliedLocked(m Market) bool {
+	nm := normalize(m.Company)
+	for _, a := range current.Applications {
+		na := normalize(a.Company)
+		if nm == na || strings.Contains(nm, na) || strings.Contains(na, nm) {
+			return true
+		}
+	}
+	return false
+}
+
+func drawPill(hdc uintptr, x, y, w int32, label string, bg, fg uintptr, f uintptr) {
+	r := RECT{x, y, x + w, y + 26}
+	fill(hdc, r, bg)
