@@ -1,0 +1,320 @@
+		text(hdc, RECT{42, y, W - 42, y + 28}, s, rgb(203, 213, 225), bodyF, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+		y += 31
+	}
+	addButton(hdc, RECT{42, y + 12, 230, y + 50}, "Veri klasörünü aç", "folder", rgb(30, 41, 59), rgb(226, 232, 240), smallF)
+	addButton(hdc, RECT{244, y + 12, 468, y + 50}, "Gmail kurulum dosyasını aç", "setup", rgb(30, 41, 59), rgb(226, 232, 240), smallF)
+	addButton(hdc, RECT{482, y + 12, 670, y + 50}, "Gmail Bağla", "gmail", rgb(37, 99, 235), rgb(255, 255, 255), smallF)
+	addButton(hdc, RECT{684, y + 12, 884, y + 50}, "Ev rotasını aç", "home-route", rgb(22, 78, 63), rgb(255, 255, 255), smallF)
+	addButton(hdc, RECT{898, y + 12, 1098, y + 50}, "Lehrstellen yenile", "market-refresh", rgb(49, 46, 129), rgb(255, 255, 255), smallF)
+	text(hdc, RECT{42, y + 76, W - 42, y + 132}, "Mesafeler internet varsa arka planda İsviçre adres araması + yol rotası ile hesaplanır; servis erişilemezse yaklaşık süre gösterilir. Gmail işlemleri de arka planda çalışır, arayüzü kilitlemez.", rgb(148, 163, 184), smallF, DT_LEFT|DT_END_ELLIPSIS)
+}
+
+func pointIn(r RECT, x, y int32) bool {
+	return x >= r.Left && x <= r.Right && y >= r.Top && y <= r.Bottom
+}
+func handleClick(x, y int32) {
+	for _, h := range hits {
+		if !pointIn(h.R, x, y) {
+			continue
+		}
+		showPress(h.Name)
+		switch {
+		case strings.HasPrefix(h.Name, "tab:"):
+			i, _ := strconv.Atoi(strings.TrimPrefix(h.Name, "tab:"))
+			activeTab = i
+			invalidate()
+			return
+		case h.Name == "update":
+			stateMu.Lock()
+			statusLine = "Güncelleme kontrol ediliyor..."
+			stateMu.Unlock()
+			checkForUpdate(true)
+			return
+		case h.Name == "market-refresh":
+			stateMu.Lock()
+			statusLine = "Lehrstellen canlı kontrol ediliyor..."
+			stateMu.Unlock()
+			refreshMarket(true)
+			return
+		case h.Name == "sync":
+			stateMu.Lock()
+			statusLine = "Gmail Yenile tıklandı"
+			stateMu.Unlock()
+			startSync(true)
+			return
+		case h.Name == "gmail":
+			stateMu.Lock()
+			statusLine = "Gmail bağlantısı açılıyor..."
+			stateMu.Unlock()
+			startOAuth()
+			return
+		case h.Name == "folder":
+			openFolder(appDataDir)
+			return
+		case h.Name == "setup":
+			openExternal(setupPath)
+			return
+		case h.Name == "home-route":
+			dataMu.RLock()
+			home := strings.TrimSpace(current.Home.Address)
+			dataMu.RUnlock()
+			if home != "" {
+				openExternal("https://www.google.com/maps/search/?api=1&query=" + url.QueryEscape(home))
+			}
+			return
+		case h.Name == "route-refresh":
+			routeMu.Lock()
+			routeCache = map[string]RouteInfo{}
+			routePending = map[string]bool{}
+			routeMu.Unlock()
+			_ = os.Remove(routeCachePath)
+			homeOnce = sync.Once{}
+			homeCoordMu.Lock()
+			homeCoord, homeCoordErr = Coord{}, nil
+			homeCoordMu.Unlock()
+			ensureHomeCoordAsync()
+			stateMu.Lock()
+			statusLine = "Mesafe önbelleği temizlendi · yeniden hesaplanıyor"
+			stateMu.Unlock()
+			invalidate()
+			return
+		case strings.HasPrefix(h.Name, "url:") || strings.HasPrefix(h.Name, "route:") || strings.HasPrefix(h.Name, "maproute:"):
+			if h.URL != "" {
+				openExternal(h.URL)
+			}
+			return
+		}
+	}
+}
+
+func tokenExists() bool { _, err := os.Stat(tokenPath); return err == nil }
+func oauthConfig() (OAuthConfig, error) {
+	b, err := os.ReadFile(oauthPath)
+	if err != nil {
+		return OAuthConfig{}, err
+	}
+	var r oauthRoot
+	if err = json.Unmarshal(b, &r); err != nil {
+		return OAuthConfig{}, err
+	}
+	if r.Installed.ClientID != "" {
+		return r.Installed, nil
+	}
+	if r.Web.ClientID != "" {
+		return r.Web, nil
+	}
+	if r.ClientID != "" {
+		return OAuthConfig{r.ClientID, r.ClientSecret}, nil
+	}
+	return OAuthConfig{}, fmt.Errorf("client_id bulunamadı")
+}
+
+func startOAuth() {
+	stateMu.Lock()
+	if oauthBusy {
+		stateMu.Unlock()
+		return
+	}
+	oauthBusy = true
+	stateMu.Unlock()
+	invalidate()
+	if _, err := os.Stat(oauthPath); err != nil {
+		stateMu.Lock()
+		oauthBusy = false
+		statusLine = "OAuth dosyası eksik"
+		stateMu.Unlock()
+		messageBox("Gmail kurulumu", "Gmail'i bağlamak için önce Google Desktop OAuth JSON dosyanı şu klasöre gmail-oauth.json adıyla koy:\n\n"+appDataDir+"\n\n'Gmail kurulum dosyasını aç' butonunda adımlar var.", MB_ICONWARNING)
+		openFolder(appDataDir)
+		invalidate()
+		return
+	}
+	go func() {
+		err := oauthFlow()
+		if err != nil {
+			stateMu.Lock()
+			statusLine = "Gmail bağlantı hatası: " + err.Error()
+			stateMu.Unlock()
+			messageBox("Gmail bağlanamadı", err.Error(), MB_ICONWARNING)
+		} else {
+			stateMu.Lock()
+			statusLine = "Gmail başarıyla bağlandı"
+			stateMu.Unlock()
+			messageBox("Gmail bağlandı", "Gmail bağlantısı tamamlandı. Bundan sonra uygulama açıkken her 10 dakikada bir Lehr başvurularını kontrol edecek.", MB_ICONINFORMATION)
+			startSync(false)
+		}
+		pPostMessageW.Call(hwndMain, WM_APP_OAUTH_DONE, 0, 0)
+	}()
+}
+
+func oauthFlow() error {
+	cfg, err := oauthConfig()
+	if err != nil {
+		return err
+	}
+	verifierBytes := make([]byte, 48)
+	rand.Read(verifierBytes)
+	verifier := base64.RawURLEncoding.EncodeToString(verifierBytes)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	redirect := fmt.Sprintf("http://127.0.0.1:%d/oauth2callback", port)
+	auth := url.URL{Scheme: "https", Host: "accounts.google.com", Path: "/o/oauth2/v2/auth"}
+	q := auth.Query()
+	q.Set("client_id", cfg.ClientID)
+	q.Set("redirect_uri", redirect)
+	q.Set("response_type", "code")
+	q.Set("scope", "https://www.googleapis.com/auth/gmail.readonly")
+	q.Set("access_type", "offline")
+	q.Set("prompt", "consent")
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+	auth.RawQuery = q.Encode()
+	openExternal(auth.String())
+	codeCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	mux := http.NewServeMux()
+	srv := &http.Server{Handler: mux}
+	mux.HandleFunc("/oauth2callback", func(w http.ResponseWriter, r *http.Request) {
+		if e := r.URL.Query().Get("error"); e != "" {
+			fmt.Fprintln(w, "Bağlantı iptal edildi. Bu pencereyi kapatabilirsiniz.")
+			errCh <- fmt.Errorf(e)
+			return
+		}
+		code := r.URL.Query().Get("code")
+		fmt.Fprintln(w, "<h2>Lehr Radar</h2><p>Gmail bağlantısı tamamlandı. Bu pencereyi kapatabilirsiniz.</p>")
+		codeCh <- code
+	})
+	go srv.Serve(ln)
+	var code string
+	select {
+	case code = <-codeCh:
+	case e := <-errCh:
+		return e
+	case <-time.After(3 * time.Minute):
+		return fmt.Errorf("Google giriş süresi doldu")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+	form := url.Values{"code": {code}, "client_id": {cfg.ClientID}, "redirect_uri": {redirect}, "grant_type": {"authorization_code"}, "code_verifier": {verifier}}
+	if cfg.ClientSecret != "" {
+		form.Set("client_secret", cfg.ClientSecret)
+	}
+	resp, err := client.PostForm("https://oauth2.googleapis.com/token", form)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("token alınamadı: %s", string(b))
+	}
+	var t Token
+	if err = json.NewDecoder(resp.Body).Decode(&t); err != nil {
+		return err
+	}
+	t.ObtainedAt = time.Now().UnixMilli()
+	b, _ := json.MarshalIndent(t, "", "  ")
+	return os.WriteFile(tokenPath, b, 0600)
+}
+
+func getAccessToken() (string, error) {
+	b, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return "", fmt.Errorf("Gmail bağlı değil")
+	}
+	var t Token
+	if err = json.Unmarshal(b, &t); err != nil {
+		return "", err
+	}
+	if t.AccessToken != "" && time.Now().UnixMilli() < t.ObtainedAt+(t.ExpiresIn*1000)-60000 {
+		return t.AccessToken, nil
+	}
+	if t.RefreshToken == "" {
+		return "", fmt.Errorf("refresh token yok")
+	}
+	cfg, err := oauthConfig()
+	if err != nil {
+		return "", err
+	}
+	form := url.Values{"client_id": {cfg.ClientID}, "refresh_token": {t.RefreshToken}, "grant_type": {"refresh_token"}}
+	if cfg.ClientSecret != "" {
+		form.Set("client_secret", cfg.ClientSecret)
+	}
+	resp, err := client.PostForm("https://oauth2.googleapis.com/token", form)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("token yenilenemedi")
+	}
+	var f Token
+	if err = json.NewDecoder(resp.Body).Decode(&f); err != nil {
+		return "", err
+	}
+	if f.RefreshToken == "" {
+		f.RefreshToken = t.RefreshToken
+	}
+	f.ObtainedAt = time.Now().UnixMilli()
+	bb, _ := json.MarshalIndent(f, "", "  ")
+	os.WriteFile(tokenPath, bb, 0600)
+	return f.AccessToken, nil
+}
+
+func gmailGET(token, endpoint string, out any) error {
+	req, _ := http.NewRequest("GET", endpoint, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Gmail HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+func gmailList(token, q string) ([]string, error) {
+	u := "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=150&q=" + url.QueryEscape(q)
+	var r struct {
+		Messages []struct {
+			ID string `json:"id"`
+		} `json:"messages"`
+	}
+	if err := gmailGET(token, u, &r); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(r.Messages))
+	for _, m := range r.Messages {
+		ids = append(ids, m.ID)
+	}
+	return ids, nil
+}
+func gmailGet(token, id string) (GMessage, error) {
+	u := "https://gmail.googleapis.com/gmail/v1/users/me/messages/" + id + "?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Date"
+	var m GMessage
+	err := gmailGET(token, u, &m)
+	return m, err
+}
+func h(m GMessage, name string) string {
+	for _, x := range m.Payload.Headers {
+		if strings.EqualFold(x.Name, name) {
+			return x.Value
+		}
+	}
+	return ""
+}
+
+var emailRe = regexp.MustCompile(`[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}`)
+
+func emailAddr(s string) string {
+	v := emailRe.FindString(strings.ToUpper(s))
+	return strings.ToLower(v)
+}
