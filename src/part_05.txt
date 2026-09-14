@@ -1,0 +1,320 @@
+}
+
+var townCoords = map[string]Coord{
+	"waltenschwil": {47.333, 8.298}, "wohlen": {47.350, 8.277}, "muri": {47.274, 8.338},
+	"seon": {47.349, 8.160}, "lenzburg": {47.387, 8.176}, "seengen": {47.326, 8.204},
+	"mellingen": {47.420, 8.273}, "gebenstorf": {47.481, 8.239}, "wettingen": {47.465, 8.327},
+	"würenlingen": {47.532, 8.256}, "koblenz": {47.609, 8.238}, "frick": {47.508, 8.019},
+	"zofingen": {47.288, 7.945}, "aarburg": {47.321, 7.900}, "safenwil": {47.321, 7.983},
+	"hunzenschwil": {47.386, 8.123}, "unterentfelden": {47.367, 8.045}, "aarau": {47.391, 8.044},
+	"mühlau": {47.230, 8.389}, "beinwil": {47.231, 8.342}, "hendschiken": {47.386, 8.216},
+	"windisch": {47.478, 8.219}, "murgenthal": {47.272, 7.831}, "aarau rohr": {47.414, 8.076},
+	"oberentfelden": {47.357, 8.044}, "kaiseraugst": {47.539, 7.728}, "spreitenbach": {47.423, 8.365},
+	"meisterschwanden": {47.294, 8.228}, "arni": {47.318, 8.420}, "baden": {47.473, 8.308},
+	"rothrist": {47.306, 7.890}, "untersiggenthal": {47.503, 8.254}, "schinznach-bad": {47.449, 8.165},
+	"schinznach": {47.449, 8.165}, "kleindöttingen": {47.571, 8.248},
+	"brugg": {47.481, 8.208}, "othmarsingen": {47.402, 8.214}, "rudolfstetten": {47.371, 8.381},
+}
+
+func coordForLocation(location string) (Coord, bool) {
+	l := strings.ToLower(strings.TrimSpace(location))
+	if l == "aargau" || l == "ag" {
+		return Coord{47.390, 8.140}, true
+	}
+	keys := make([]string, 0, len(townCoords))
+	for k := range townCoords {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
+	for _, k := range keys {
+		if strings.Contains(l, k) || strings.Contains(k, l) {
+			return townCoords[k], true
+		}
+	}
+	return Coord{}, false
+}
+
+func worldPixel(c Coord, zoom int) (float64, float64) {
+	n := math.Exp2(float64(zoom))
+	x := (c.Lon + 180.0) / 360.0 * n * 256.0
+	lat := c.Lat * math.Pi / 180.0
+	y := (1.0 - math.Log(math.Tan(lat)+1.0/math.Cos(lat))/math.Pi) / 2.0 * n * 256.0
+	return x, y
+}
+
+func tileFilename(z, x, y int) string {
+	return filepath.Join(tileCacheDir, fmt.Sprintf("%d-%d-%d.png", z, x, y))
+}
+
+func scheduleTile(z, x, y int, path string) {
+	key := fmt.Sprintf("%d/%d/%d", z, x, y)
+	tileMu.Lock()
+	if tilePending[key] {
+		tileMu.Unlock()
+		return
+	}
+	tilePending[key] = true
+	tileMu.Unlock()
+	go func() {
+		tileSem <- struct{}{}
+		defer func() { <-tileSem }()
+		u := fmt.Sprintf("https://tile.openstreetmap.org/%d/%d/%d.png", z, x, y)
+		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("User-Agent", "LehrRadar/"+appVersion+" (personal desktop app)")
+		resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+		if err == nil && resp.StatusCode < 300 {
+			tmp := path + ".part"
+			if f, e := os.Create(tmp); e == nil {
+				_, e = io.Copy(f, resp.Body)
+				_ = f.Close()
+				if e == nil {
+					_ = os.Rename(tmp, path)
+				} else {
+					_ = os.Remove(tmp)
+				}
+			}
+		}
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		tileMu.Lock()
+		delete(tilePending, key)
+		tileMu.Unlock()
+		pPostMessageW.Call(hwndMain, WM_APP_TILE_DONE, 0, 0)
+	}()
+}
+
+func tileImage(z, x, y int) uintptr {
+	path := tileFilename(z, x, y)
+	tileMu.Lock()
+	if img := tileImages[path]; img != 0 {
+		tileMu.Unlock()
+		return img
+	}
+	tileMu.Unlock()
+	if st, err := os.Stat(path); err == nil && st.Size() > 100 {
+		var img uintptr
+		status, _, _ := pGdipLoadImageFromFile.Call(uintptr(unsafe.Pointer(wstr(path))), uintptr(unsafe.Pointer(&img)))
+		if status == 0 && img != 0 {
+			tileMu.Lock()
+			tileImages[path] = img
+			tileMu.Unlock()
+			return img
+		}
+		_ = os.Remove(path)
+	}
+	scheduleTile(z, x, y, path)
+	return 0
+}
+
+func drawMarker(hdc uintptr, x, y, radius int32, bg, border uintptr) {
+	b := brush(bg)
+	p := penCache[border]
+	if p == 0 {
+		p, _, _ = pCreatePen.Call(PS_SOLID, 2, border)
+		penCache[border] = p
+	}
+	oldB, _, _ := pSelectObject.Call(hdc, b)
+	oldP, _, _ := pSelectObject.Call(hdc, p)
+	pEllipse.Call(hdc, uintptr(x-radius), uintptr(y-radius), uintptr(x+radius), uintptr(y+radius))
+	pSelectObject.Call(hdc, oldP)
+	pSelectObject.Call(hdc, oldB)
+}
+
+func drawOSMMap(hdc uintptr, r RECT, items []MapItem, smallF, boldF uintptr) {
+	// Stability-first native map. Earlier builds decoded OSM PNG tiles inside WM_PAINT;
+	// on some Windows systems GDI+/disk/network contention could make the window appear
+	// "Not responding". This version keeps all paint work local and deterministic while
+	// still plotting real town coordinates and opening Google Maps for navigation.
+	fill(hdc, r, rgb(17, 30, 48))
+	// Aargau-ish grid/background for geographic orientation.
+	for x := r.Left + 70; x < r.Right; x += 110 {
+		line(hdc, x, r.Top, x, r.Bottom, rgb(35, 53, 73))
+	}
+	for y := r.Top + 52; y < r.Bottom; y += 78 {
+		line(hdc, r.Left, y, r.Right, y, rgb(35, 53, 73))
+	}
+	line(hdc, r.Left, r.Top, r.Right, r.Top, rgb(71, 85, 105))
+	line(hdc, r.Left, r.Bottom-1, r.Right, r.Bottom-1, rgb(71, 85, 105))
+	line(hdc, r.Left, r.Top, r.Left, r.Bottom, rgb(71, 85, 105))
+	line(hdc, r.Right-1, r.Top, r.Right-1, r.Bottom, rgb(71, 85, 105))
+
+	// Bounds cover Aargau and nearby Zofingen/Murgenthal area.
+	const minLon, maxLon = 7.70, 8.45
+	const minLat, maxLat = 47.20, 47.63
+	project := func(c Coord) (int32, int32) {
+		x := float64(r.Left+24) + (c.Lon-minLon)/(maxLon-minLon)*float64((r.Right-r.Left)-48)
+		y := float64(r.Bottom-24) - (c.Lat-minLat)/(maxLat-minLat)*float64((r.Bottom-r.Top)-48)
+		return int32(x), int32(y)
+	}
+
+	// Home marker if we know the exact locally geocoded position, otherwise Waltenschwil.
+	home, ok := cachedHomeCoord()
+	if !ok {
+		home = townCoords["waltenschwil"]
+	}
+	hx, hy := project(home)
+	drawMarker(hdc, hx, hy, 8, rgb(22, 163, 74), rgb(220, 252, 231))
+	text(hdc, RECT{hx + 10, hy - 12, hx + 90, hy + 12}, "EV", rgb(220, 252, 231), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+
+	for _, it := range items {
+		c, ok := coordForLocation(it.Location)
+		if !ok {
+			continue
+		}
+		x, y := project(c)
+		if x < r.Left+8 || x > r.Right-8 || y < r.Top+8 || y > r.Bottom-8 {
+			continue
+		}
+		bg := rgb(37, 99, 235)
+		if !it.Applied {
+			bg = rgb(124, 58, 237)
+		}
+		if it.Status == "rejected" {
+			bg = rgb(185, 28, 28)
+		}
+		if it.Status == "positive" {
+			bg = rgb(5, 150, 105)
+		}
+		drawMarker(hdc, x, y, 5, bg, rgb(226, 232, 240))
+	}
+
+	text(hdc, RECT{r.Left + 14, r.Top + 8, r.Right - 14, r.Top + 30}, "Aargau haritası · hafif mod", rgb(226, 232, 240), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	text(hdc, RECT{r.Left + 14, r.Bottom - 32, r.Right - 14, r.Bottom - 8}, "Yeşil: ev/olumlu · Mavi: başvuru · Mor: başvurulmadı · Kırmızı: red", rgb(148, 163, 184), smallF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+}
+
+func buildMapItems() []MapItem {
+	dataMu.RLock()
+	apps := append([]Application(nil), current.Applications...)
+	markets := append([]Market(nil), current.Market...)
+	dataMu.RUnlock()
+	items := make([]MapItem, 0, len(apps)+len(markets))
+	for _, a := range apps {
+		items = append(items, MapItem{Key: "app:" + a.ID, Company: a.Company, Location: a.Location, Address: a.Address, Status: a.Status, Applied: true})
+	}
+	for _, m := range markets {
+		applied := false
+		for _, a := range apps {
+			na, nm := normalize(a.Company), normalize(m.Company)
+			if na == nm || strings.Contains(na, nm) || strings.Contains(nm, na) {
+				applied = true
+				break
+			}
+		}
+		if !applied {
+			items = append(items, MapItem{Key: "market:" + m.ID, Company: m.Company, Location: m.Location, Address: m.Address, Status: "not_applied", Applied: false})
+		}
+	}
+	return items
+}
+
+func drawDistanceTab(hdc uintptr, W, H int32, boldF, bodyF, smallF uintptr) {
+	dataMu.RLock()
+	home := current.Home
+	dataMu.RUnlock()
+	text(hdc, RECT{28, 150, W - 28, 182}, "Harita / Mesafe", rgb(226, 232, 240), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	homeR := RECT{28, 188, W - 28, 240}
+	fill(hdc, homeR, rgb(17, 31, 50))
+	text(hdc, RECT{44, 194, 88, 218}, "EV", rgb(125, 211, 252), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	text(hdc, RECT{88, 194, W - 420, 218}, home.Address, rgb(226, 232, 240), bodyF, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+	text(hdc, RECT{88, 216, W - 420, 237}, "Dakikalar ev adresinden tahmini araba süresi. Harita canlı OpenStreetMap katmanı kullanır.", rgb(100, 116, 139), smallF, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+	addButton(hdc, RECT{W - 392, 196, W - 236, 232}, "Evi haritada aç", "home-route", rgb(22, 78, 63), rgb(255, 255, 255), smallF)
+	addButton(hdc, RECT{W - 224, 196, W - 42, 232}, "Mesafeleri yenile", "route-refresh", rgb(30, 64, 175), rgb(255, 255, 255), smallF)
+
+	items := buildMapItems()
+	// Sort with instant local estimates; exact routes are only requested for visible rows.
+	sort.SliceStable(items, func(i, j int) bool {
+		fi, _ := fallbackRoute(items[i].Location)
+		fj, _ := fallbackRoute(items[j].Location)
+		mi, mj := fi.Minutes, fj.Minutes
+		if mi == 0 {
+			mi = 9999
+		}
+		if mj == 0 {
+			mj = 9999
+		}
+		if mi != mj {
+			return mi < mj
+		}
+		return items[i].Company < items[j].Company
+	})
+
+	listW := int32(390)
+	mapR := RECT{28, 252, W - listW - 46, H - 48}
+	if mapR.Right-mapR.Left < 420 {
+		mapR.Right = mapR.Left + 420
+	}
+	drawOSMMap(hdc, mapR, items, smallF, boldF)
+
+	listX := mapR.Right + 16
+	text(hdc, RECT{listX, 252, W - 28, 280}, "En yakın yerler", rgb(226, 232, 240), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	off := offsets[activeTab]
+	if off < 0 {
+		off = 0
+	}
+	if off > len(items)-1 && len(items) > 0 {
+		off = len(items) - 1
+		offsets[activeTab] = off
+	}
+	if off < len(items) {
+		items = items[off:]
+	} else {
+		items = nil
+	}
+	y := int32(286)
+	rh := int32(66)
+	for _, it := range items {
+		if y+rh > H-48 {
+			break
+		}
+		r := RECT{listX, y, W - 28, y + rh - 6}
+		fill(hdc, r, rgb(15, 23, 42))
+		text(hdc, RECT{listX + 12, y + 5, W - 165, y + 27}, it.Company, rgb(241, 245, 249), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+		label := "Başvuruldu"
+		if !it.Applied {
+			label = "Başvurulmadı"
+		}
+		text(hdc, RECT{listX + 12, y + 28, W - 165, y + 49}, it.Location+" · "+label, rgb(148, 163, 184), smallF, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+		dest := routeDestination(it.Address, it.Location)
+		ri := routeFor(it.Key, dest, it.Location)
+		detail := routeLabel(ri)
+		if ri.KM > 0 {
+			detail = fmt.Sprintf("%s · %.1f km", detail, ri.KM)
+		}
+		addButton(hdc, RECT{W - 154, y + 12, W - 42, y + 48}, detail, "route:list:"+it.Key, rgb(22, 45, 66), rgb(186, 230, 253), smallF)
+		hits[len(hits)-1].URL = googleRouteURL(dest)
+		y += rh
+	}
+}
+
+func drawSettings(hdc uintptr, W, H int32, boldF, bodyF, smallF uintptr) {
+	text(hdc, RECT{28, 150, W - 28, 182}, "Ayarlar & Gmail bağlantısı", rgb(226, 232, 240), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	connected := "Bağlı değil"
+	if tokenExists() {
+		connected = "Bağlı ✓"
+	}
+	configured := "Yok"
+	if _, err := os.Stat(oauthPath); err == nil {
+		configured = "Hazır ✓"
+	}
+	dataMu.RLock()
+	home := current.Home.Address
+	checked := current.Meta.MarketLastChecked
+	dataMu.RUnlock()
+	stateMu.Lock()
+	us := updateStatus
+	ms := marketStatus
+	stateMu.Unlock()
+	labels := []string{
+		fmt.Sprintf("Sürüm: %s", appVersion),
+		fmt.Sprintf("Otomatik güncelleme: %s", us),
+		fmt.Sprintf("Canlı Lehrstellen: %s", ms),
+		fmt.Sprintf("Gmail durumu: %s", connected),
+		fmt.Sprintf("OAuth dosyası: %s", configured),
+		fmt.Sprintf("Ev: %s", home),
+		fmt.Sprintf("Lehrstellen son kontrol: %s", checked),
+		"Otomatik Gmail kontrolü: uygulama açıkken her 10 dakikada bir",
+		"Performans modu: native Win32 + çift tamponlu çizim + arka plan ağ işlemleri",
+	}
+	y := int32(200)
+	for _, s := range labels {
