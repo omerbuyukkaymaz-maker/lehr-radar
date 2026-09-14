@@ -1,0 +1,320 @@
+}
+
+func routeDestination(address, location string) string {
+	if strings.TrimSpace(address) != "" {
+		return address
+	}
+	if strings.TrimSpace(location) != "" {
+		return location + ", Schweiz"
+	}
+	return "Kanton Aargau, Schweiz"
+}
+
+func googleRouteURL(dest string) string {
+	dataMu.RLock()
+	origin := current.Home.Address
+	dataMu.RUnlock()
+	q := url.Values{}
+	q.Set("api", "1")
+	q.Set("origin", origin)
+	q.Set("destination", dest)
+	q.Set("travelmode", "driving")
+	return "https://www.google.com/maps/dir/?" + q.Encode()
+}
+
+func haversineKM(a, b Coord) float64 {
+	const R = 6371.0
+	lat1, lat2 := a.Lat*math.Pi/180, b.Lat*math.Pi/180
+	dlat := (b.Lat - a.Lat) * math.Pi / 180
+	dlon := (b.Lon - a.Lon) * math.Pi / 180
+	h := math.Sin(dlat/2)*math.Sin(dlat/2) + math.Cos(lat1)*math.Cos(lat2)*math.Sin(dlon/2)*math.Sin(dlon/2)
+	return 2 * R * math.Asin(math.Sqrt(h))
+}
+
+func cachedHomeCoord() (Coord, bool) {
+	homeCoordMu.RLock()
+	defer homeCoordMu.RUnlock()
+	return homeCoord, homeCoord.Lat != 0 || homeCoord.Lon != 0
+}
+
+func fallbackRoute(location string) (RouteInfo, bool) {
+	target, ok := coordForLocation(location)
+	if !ok {
+		return RouteInfo{}, false
+	}
+	home, homeOK := cachedHomeCoord()
+	if !homeOK {
+		// Generic temporary center until the user's own home address is geocoded.
+		home = Coord{47.390, 8.140}
+	}
+	km := haversineKM(home, target)
+	// Conservative road factor + city/entry overhead. Exact OSRM value replaces this in background.
+	roadKM := km * 1.28
+	minutes := int(math.Round(roadKM/52.0*60.0 + 5.0))
+	if minutes < 4 {
+		minutes = 4
+	}
+	return RouteInfo{Minutes: minutes, KM: roadKM, Estimated: true}, true
+}
+
+func geocodeSwiss(q string) (Coord, error) {
+	u := "https://api3.geo.admin.ch/rest/services/api/SearchServer?type=locations&limit=1&searchText=" + url.QueryEscape(q)
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", "LehrRadar/"+appVersion)
+	resp, err := routeClient.Do(req)
+	if err != nil {
+		return Coord{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return Coord{}, fmt.Errorf("geocoding HTTP %d", resp.StatusCode)
+	}
+	var r struct {
+		Results []struct {
+			Attrs struct {
+				Lat float64 `json:"lat"`
+				Lon float64 `json:"lon"`
+			} `json:"attrs"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return Coord{}, err
+	}
+	if len(r.Results) == 0 || (r.Results[0].Attrs.Lat == 0 && r.Results[0].Attrs.Lon == 0) {
+		return Coord{}, fmt.Errorf("konum bulunamadı")
+	}
+	return Coord{Lat: r.Results[0].Attrs.Lat, Lon: r.Results[0].Attrs.Lon}, nil
+}
+
+func getHomeCoord() (Coord, error) {
+	homeOnce.Do(func() {
+		dataMu.RLock()
+		addr := strings.TrimSpace(current.Home.Address)
+		dataMu.RUnlock()
+		if addr == "" {
+			homeCoordMu.Lock()
+			homeCoordErr = fmt.Errorf("ev adresi ayarlanmamış")
+			homeCoordMu.Unlock()
+			return
+		}
+		c, err := geocodeSwiss(addr)
+		homeCoordMu.Lock()
+		homeCoord, homeCoordErr = c, err
+		homeCoordMu.Unlock()
+	})
+	homeCoordMu.RLock()
+	defer homeCoordMu.RUnlock()
+	return homeCoord, homeCoordErr
+}
+
+func ensureHomeCoordAsync() {
+	if _, ok := cachedHomeCoord(); ok {
+		return
+	}
+	go func() {
+		_, _ = getHomeCoord()
+		pPostMessageW.Call(hwndMain, WM_APP_ROUTE_DONE, 0, 0)
+	}()
+}
+
+func routeOSRM(a, b Coord) (RouteInfo, error) {
+	u := fmt.Sprintf("https://router.project-osrm.org/route/v1/driving/%.6f,%.6f;%.6f,%.6f?overview=false", a.Lon, a.Lat, b.Lon, b.Lat)
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", "LehrRadar/"+appVersion)
+	resp, err := routeClient.Do(req)
+	if err != nil {
+		return RouteInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return RouteInfo{}, fmt.Errorf("route HTTP %d", resp.StatusCode)
+	}
+	var r struct {
+		Routes []struct {
+			Duration float64 `json:"duration"`
+			Distance float64 `json:"distance"`
+		} `json:"routes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return RouteInfo{}, err
+	}
+	if len(r.Routes) == 0 {
+		return RouteInfo{}, fmt.Errorf("rota bulunamadı")
+	}
+	return RouteInfo{Minutes: int(math.Round(r.Routes[0].Duration / 60)), KM: r.Routes[0].Distance / 1000}, nil
+}
+
+func routeFor(key, dest, location string) RouteInfo {
+	routeMu.Lock()
+	if r, ok := routeCache[key]; ok {
+		routeMu.Unlock()
+		return r
+	}
+	if !routePending[key] {
+		routePending[key] = true
+		go func() {
+			routeSem <- struct{}{}
+			defer func() { <-routeSem }()
+			home, err := getHomeCoord()
+			var out RouteInfo
+			if err == nil {
+				var target Coord
+				target, err = geocodeSwiss(dest)
+				if err == nil {
+					out, err = routeOSRM(home, target)
+				}
+			}
+			if err != nil {
+				if f, ok := fallbackRoute(location); ok {
+					out = f
+					out.Err = err.Error()
+				} else {
+					out = RouteInfo{Err: err.Error(), Estimated: true}
+				}
+			}
+			routeMu.Lock()
+			routeCache[key] = out
+			delete(routePending, key)
+			routeMu.Unlock()
+			go saveRouteCache()
+			pPostMessageW.Call(hwndMain, WM_APP_ROUTE_DONE, 0, 0)
+		}()
+	}
+	routeMu.Unlock()
+	if f, ok := fallbackRoute(location); ok {
+		return f
+	}
+	return RouteInfo{Estimated: true}
+}
+
+func routeLabel(r RouteInfo) string {
+	if r.Minutes <= 0 {
+		return "… dk"
+	}
+	if r.Estimated {
+		return fmt.Sprintf("~%d dk", r.Minutes)
+	}
+	return fmt.Sprintf("%d dk", r.Minutes)
+}
+
+func statusLabel(st string) (string, uintptr, uintptr) {
+	switch st {
+	case "rejected":
+		return "RED", rgb(127, 29, 29), rgb(254, 226, 226)
+	case "reviewing":
+		return "İNCELENİYOR", rgb(113, 63, 18), rgb(254, 243, 199)
+	case "positive":
+		return "OLUMLU", rgb(20, 83, 45), rgb(220, 252, 231)
+	default:
+		return "BEKLENİYOR", rgb(30, 64, 175), rgb(219, 234, 254)
+	}
+}
+
+func drawApplications(hdc uintptr, W, H int32, boldF, bodyF, smallF uintptr, rejectedOnly bool) {
+	dataMu.RLock()
+	var apps []Application
+	for _, a := range current.Applications {
+		if !rejectedOnly || a.Status == "rejected" {
+			apps = append(apps, a)
+		}
+	}
+	dataMu.RUnlock()
+	sort.SliceStable(apps, func(i, j int) bool { return apps[i].AppliedDate > apps[j].AppliedDate })
+	title := "Tüm Lehr başvuruları"
+	if rejectedOnly {
+		title = "Red gelen garajlar"
+	}
+	text(hdc, RECT{28, 150, W - 28, 182}, title, rgb(226, 232, 240), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	off := offsets[activeTab]
+	if off > len(apps)-1 && len(apps) > 0 {
+		off = len(apps) - 1
+		offsets[activeTab] = off
+	}
+	if off < 0 {
+		off = 0
+	}
+	if off < len(apps) {
+		apps = apps[off:]
+	} else {
+		apps = nil
+	}
+	drawAppRows(hdc, apps, 190, W, H, boldF, bodyF, smallF)
+}
+
+func drawAppRows(hdc uintptr, apps []Application, startY, W, H int32, boldF, bodyF, smallF uintptr) {
+	y := startY
+	rh := int32(62)
+	for _, a := range apps {
+		if y+rh > H-48 {
+			break
+		}
+		r := RECT{28, y, W - 28, y + rh - 5}
+		fill(hdc, r, rgb(15, 23, 42))
+		text(hdc, RECT{42, y + 7, W - 460, y + 29}, a.Company, rgb(241, 245, 249), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+		text(hdc, RECT{42, y + 30, W - 460, y + 52}, fmt.Sprintf("%s · %s · %s", a.Location, a.AppliedDate, a.Email), rgb(148, 163, 184), smallF, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+		dest := routeDestination(a.Address, a.Location)
+		ri := routeFor("app:"+a.ID, dest, a.Location)
+		routeR := RECT{W - 302, y + 14, W - 214, y + 48}
+		addButton(hdc, routeR, routeLabel(ri), "route:app:"+a.ID, rgb(22, 45, 66), rgb(186, 230, 253), smallF)
+		hits[len(hits)-1].URL = googleRouteURL(dest)
+		lab, bg, fg := statusLabel(a.Status)
+		pw := int32(116)
+		if lab == "İNCELENİYOR" {
+			pw = 132
+		}
+		drawPill(hdc, W-190, y+18, pw, lab, bg, fg, smallF)
+		y += rh
+	}
+}
+
+func drawMarket(hdc uintptr, W, H int32, boldF, bodyF, smallF uintptr) {
+	mk := unappliedMarkets()
+	sort.SliceStable(mk, func(i, j int) bool {
+		if mk[i].Availability != mk[j].Availability {
+			return mk[i].Availability == "available"
+		}
+		return mk[i].Location < mk[j].Location
+	})
+	text(hdc, RECT{28, 150, W - 28, 182}, "Kanton AG · Henüz başvurmadığın Lehrbetriebe", rgb(226, 232, 240), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	dataMu.RLock()
+	checked := current.Meta.MarketLastChecked
+	dataMu.RUnlock()
+	text(hdc, RECT{28, 180, W - 28, 204}, "Son piyasa kontrolü: "+checked+" · Mavi = 2027 açık · Gri = 2027 durumu net değil", rgb(100, 116, 139), smallF, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	off := offsets[activeTab]
+	if off > len(mk)-1 && len(mk) > 0 {
+		off = len(mk) - 1
+	}
+	if off < len(mk) {
+		mk = mk[off:]
+	} else {
+		mk = nil
+	}
+	y := int32(212)
+	rh := int32(72)
+	for _, m := range mk {
+		if y+rh > H-48 {
+			break
+		}
+		r := RECT{28, y, W - 28, y + rh - 5}
+		fill(hdc, r, rgb(15, 23, 42))
+		text(hdc, RECT{42, y + 7, W - 450, y + 28}, m.Company, rgb(241, 245, 249), boldF, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+		text(hdc, RECT{42, y + 29, W - 450, y + 50}, fmt.Sprintf("%s · %s · %d", m.Location, m.Direction, m.Year), rgb(148, 163, 184), smallF, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+		av := "DURUM BELİRSİZ"
+		bg := rgb(51, 65, 85)
+		fg := rgb(226, 232, 240)
+		if m.Availability == "available" {
+			av = "2027 AÇIK"
+			bg = rgb(30, 64, 175)
+			fg = rgb(219, 234, 254)
+		}
+		drawPill(hdc, W-420, y+21, 120, av, bg, fg, smallF)
+		dest := routeDestination(m.Address, m.Location)
+		ri := routeFor("market:"+m.ID, dest, m.Location)
+		rr := RECT{W - 288, y + 17, W - 202, y + 54}
+		addButton(hdc, rr, routeLabel(ri), "route:market:"+m.ID, rgb(22, 45, 66), rgb(186, 230, 253), smallF)
+		hits[len(hits)-1].URL = googleRouteURL(dest)
+		br := RECT{W - 188, y + 17, W - 42, y + 54}
+		addButton(hdc, br, "İlanı Aç", "url:"+m.ID, rgb(30, 41, 59), rgb(191, 219, 254), smallF)
+		hits[len(hits)-1].URL = m.SourceURL
+		y += rh
+	}
