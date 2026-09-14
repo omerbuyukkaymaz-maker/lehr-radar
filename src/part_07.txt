@@ -1,0 +1,235 @@
+func statusFromText(s string) string {
+	t := strings.ToLower(s)
+	if rejectRe.MatchString(t) {
+		return "rejected"
+	}
+	if positiveRe.MatchString(t) {
+		return "positive"
+	}
+	if reviewingRe.MatchString(t) {
+		return "reviewing"
+	}
+	return "waiting"
+}
+
+var known = map[string][2]string{
+	"info.retail-schinznach@amag.ch": {"AMAG Schinznach", "Schinznach"}, "autocenter@emilfrey.ch": {"Emil Frey Safenwil", "Safenwil"}, "lernende@kennys.ch": {"Kenny's Auto-Center AG", "Wettingen"}, "hr@kueng-automobile.ch": {"Küng Automobile", "Aargau"}, "martina.bruder@feldgarage-seengen.ch": {"Feldgarage Seengen AG", "Seengen"}, "f.erne@automeierag.ch": {"Auto Meier AG", "Kleindöttingen"}, "info@garage-ruetter.ch": {"Garage Rütter AG", "Mühlau"}, "s.kloetzli@rhauto.ch": {"RH Auto-Service Lenzburg AG", "Lenzburg"}, "garage.haller@bluewin.ch": {"Haller Automobile AG", "Zofingen"}, "info@hasler-garage.ch": {"Walter Hasler AG", "Frick"}, "pinar@gmx.ch": {"Garage Pinar", "Aarburg"}, "ausbildung@baechli-auto.ch": {"Bächli Automobile AG", "Würenlingen"}, "garage@nusser.ch": {"K. Nusser AG", "Koblenz"}, "info@autoschlatterag.ch": {"Auto Schlatter AG", "Aargau"}, "hunzenschwil@bestdrive.ch": {"BestDrive Switzerland AG", "Hunzenschwil"}, "info@garage-frey.ch": {"Garage Frey Unterentfelden AG", "Unterentfelden"}, "info@rigacker.ch": {"Garage / Auto Rigacker", "Aargau"}, "info@garage-weibel.ch": {"Garage Weibel", "Untersiggenthal"}, "info@tinnerag.ch": {"Ruedi Tinner AG", "Aargau"}, "m.hosang@autoschneider.ch": {"Auto Schneider AG", "Würenlingen"}, "info@huber-automobile.ch": {"Huber Automobile AG", "Mellingen"}, "info@citygaragegmbh.ch": {"City-Garage GmbH", "Aarau"}, "garage@sutersepp.ch": {"Garage Sepp Suter", "Beinwil (Freiamt)"}, "samoa.huegli@huegli.swiss": {"Hügli", "Aargau"}, "info-wohlen@hedinautomotive.ch": {"Hedin Automotive Schweiz AG", "Wohlen"}}
+
+func startSync(userTriggered bool) {
+	if !tokenExists() {
+		if userTriggered {
+			messageBox("Gmail bağlı değil", "Önce 'Gmail Bağla' butonunu kullan. İlk kurulum için Google Desktop OAuth JSON gerekir.", MB_ICONWARNING)
+		}
+		return
+	}
+	stateMu.Lock()
+	if syncBusy {
+		stateMu.Unlock()
+		return
+	}
+	syncBusy = true
+	statusLine = "Gmail kontrol ediliyor..."
+	stateMu.Unlock()
+	invalidate()
+	go func() {
+		changes, err := syncGmail()
+		if err != nil {
+			stateMu.Lock()
+			statusLine = "Senkron hatası: " + err.Error()
+			lastSyncText = "Son deneme: " + time.Now().Format("15:04")
+			stateMu.Unlock()
+			if userTriggered {
+				messageBox("Senkron hatası", err.Error(), MB_ICONWARNING)
+			}
+		} else {
+			stateMu.Lock()
+			statusLine = fmt.Sprintf("Gmail güncel · %d değişiklik", len(changes))
+			lastSyncText = "Son Gmail kontrolü: " + time.Now().Format("02.01.2006 15:04")
+			stateMu.Unlock()
+			if len(changes) > 0 {
+				stateMu.Lock()
+				lastAlert = strings.Join(changes, " · ")
+				alertUntil = time.Now().Add(12 * time.Second)
+				stateMu.Unlock()
+				notifyUser()
+			}
+		}
+		pPostMessageW.Call(hwndMain, WM_APP_SYNC_DONE, 0, 0)
+	}()
+}
+
+func syncGmail() ([]string, error) {
+	token, err := getAccessToken()
+	if err != nil {
+		return nil, err
+	}
+	dataMu.RLock()
+	cursor := current.Meta.GmailLastSyncUnix
+	dataMu.RUnlock()
+	if cursor == 0 {
+		cursor = time.Now().Add(-7 * 24 * time.Hour).Unix()
+	}
+	// One-day overlap avoids missing messages around midnight/time-zone boundaries.
+	since := time.Unix(cursor, 0).Add(-24 * time.Hour).Format("2006/01/02")
+	sentIDs, err := gmailList(token, fmt.Sprintf(`in:sent after:%s ("Automobil-Fachmann" OR "Automobilfachmann" OR "Lehrstelle")`, since))
+	if err != nil {
+		return nil, err
+	}
+	incIDs, err := gmailList(token, fmt.Sprintf(`after:%s ("Automobil-Fachmann" OR "Automobilfachmann" OR "Lehrstelle" OR "Absage" OR "abgelehnt" OR "Schnupper") -from:me`, since))
+	if err != nil {
+		return nil, err
+	}
+	fetchAll := func(ids []string) []GMessage {
+		out := make([]GMessage, 0, len(ids))
+		sem := make(chan struct{}, 4)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for _, id := range ids {
+			id := id
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sem <- struct{}{}
+				m, e := gmailGet(token, id)
+				<-sem
+				if e == nil {
+					mu.Lock()
+					out = append(out, m)
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+		return out
+	}
+	sent := fetchAll(sentIDs)
+	incoming := fetchAll(incIDs)
+	dataMu.Lock()
+	defer dataMu.Unlock()
+	byThread := map[string]int{}
+	for i, a := range current.Applications {
+		if a.ThreadID != "" {
+			byThread[a.ThreadID] = i
+		}
+	}
+	for _, m := range sent {
+		if _, ok := byThread[m.ThreadID]; ok {
+			continue
+		}
+		to := emailAddr(h(m, "To"))
+		k, ok := known[to]
+		company := to
+		loc := "Aargau"
+		if ok {
+			company = k[0]
+			loc = k[1]
+		}
+		sub := h(m, "Subject")
+		if strings.Contains(strings.ToLower(sub), "agvs-eignungstest") {
+			continue
+		}
+		date := time.Now().Format("2006-01-02")
+		if ms, er := strconv.ParseInt(m.InternalDate, 10, 64); er == nil {
+			date = time.UnixMilli(ms).Format("2006-01-02")
+		}
+		id := "gmail-" + m.ID
+		current.Applications = append(current.Applications, Application{ID: id, Company: company, Location: loc, Email: to, AppliedDate: date, Status: "waiting", Source: "gmail", ThreadID: m.ThreadID, Note: "Gmail üzerinden otomatik eklendi."})
+		byThread[m.ThreadID] = len(current.Applications) - 1
+	}
+	var changes []string
+	for _, m := range incoming {
+		idx, ok := byThread[m.ThreadID]
+		if !ok {
+			continue
+		}
+		txt := h(m, "Subject") + " " + m.Snippet
+		ns := statusFromText(txt)
+		old := current.Applications[idx].Status
+		if ns != "waiting" && ns != old {
+			current.Applications[idx].Status = ns
+			current.Applications[idx].Note = "Gmail cevabı: " + m.Snippet
+			if ns == "rejected" || ns == "positive" {
+				lab := "Olumlu"
+				if ns == "rejected" {
+					lab = "Red"
+				}
+				changes = append(changes, current.Applications[idx].Company+": "+lab)
+			}
+		}
+	}
+	current.Meta.GmailLastSyncUnix = time.Now().Unix()
+	b, _ := json.MarshalIndent(current, "", "  ")
+	if err = os.WriteFile(dataPath, b, 0644); err != nil {
+		return changes, err
+	}
+	return changes, nil
+}
+
+const gmailSetupText = `LEHR RADAR - GMAIL CANLI SENKRON KURULUMU
+
+Bu EXE Node.js istemez ve direkt çalışır.
+Gmail'i otomatik okuyabilmesi için Google'ın güvenlik kuralı nedeniyle bir kere kendi OAuth Desktop Client dosyanı vermen gerekir.
+
+1) Google Cloud Console'a gir: https://console.cloud.google.com/
+2) Bir proje oluştur (ör. Lehr Radar).
+3) APIs & Services > Library > Gmail API > Enable.
+4) OAuth consent screen bölümünde uygulamayı External olarak ayarla ve kendi Gmail adresini Test User olarak ekle.
+5) Credentials > Create Credentials > OAuth client ID.
+6) Application type: Desktop app.
+7) JSON'u indir.
+8) İndirdiğin JSON'u bu klasöre kopyala ve adını TAM olarak gmail-oauth.json yap:
+
+%APPDATA%\LehrRadar\gmail-oauth.json
+
+9) Lehr Radar'ı açıp Gmail Bağla butonuna bas.
+10) Tarayıcıda kendi Google hesabınla izin ver.
+
+Uygulama sadece Gmail read-only izni ister; mail gönderemez/silemez.
+`
+
+func main() {
+	if !ensureInstalled() {
+		return
+	}
+	if err := initFiles(); err != nil {
+		fmt.Println(err)
+		return
+	}
+	initGDIPlus()
+	defer func() {
+		cleanupBackbuffer()
+		shutdownGDIPlus()
+	}()
+	initFonts()
+	hInst, _, _ := pGetModuleHandleW.Call(0)
+	cls := wstr("LehrRadarNativeClass")
+	cur, _, _ := pLoadCursorW.Call(0, IDC_ARROW)
+	wc := WNDCLASSEX{CbSize: uint32(unsafe.Sizeof(WNDCLASSEX{})), LpfnWndProc: syscall.NewCallback(wndProc), HInstance: hInst, HCursor: cur, LpszClassName: uintptr(unsafe.Pointer(cls))}
+	if r, _, _ := pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); r == 0 {
+		messageBox("Hata", "Pencere sınıfı oluşturulamadı.", MB_ICONWARNING)
+		return
+	}
+	hwnd, _, _ := pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(wstr("Lehr Radar - Automobil-Fachmann EFZ"))), WS_OVERLAPPEDWINDOW|WS_VISIBLE, 120, 80, 1380, 860, 0, 0, hInst, 0)
+	hwndMain = hwnd
+	pShowWindow.Call(hwnd, SW_SHOW)
+	pUpdateWindow.Call(hwnd)
+	pSetTimer.Call(hwnd, 1, 10*60*1000, 0)
+	pSetTimer.Call(hwnd, 2, 5*60*1000, 0)
+	pSetTimer.Call(hwnd, 3, 30*60*1000, 0)
+	pSetTimer.Call(hwnd, 4, 60*60*1000, 0)
+	go func() { time.Sleep(500 * time.Millisecond); ensureHomeCoordAsync() }()
+	go func() { time.Sleep(1200 * time.Millisecond); checkForUpdate(false) }()
+	go func() { time.Sleep(1800 * time.Millisecond); refreshMarket(false) }()
+	if tokenExists() {
+		go func() { time.Sleep(2400 * time.Millisecond); startSync(false) }()
+	}
+	var msg MSG
+	for {
+		r, _, _ := pGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		if int32(r) <= 0 {
+			break
+		}
+		pTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		pDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+}
