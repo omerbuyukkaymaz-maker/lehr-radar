@@ -1,0 +1,71 @@
+name: Build Lehr Radar Windows
+
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'seed.json'
+      - 'go.mod'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+
+      - name: Assemble source
+        shell: bash
+        run: cat src/part_*.txt > main.go
+
+      - name: Generate public market feed
+        shell: python
+        run: |
+          import json
+          with open('seed.json', encoding='utf-8') as f:
+              seed = json.load(f)
+          with open('market.json', 'w', encoding='utf-8') as f:
+              json.dump(seed.get('market', []), f, ensure_ascii=False, indent=2)
+
+      - name: Format and compile check
+        shell: bash
+        run: |
+          gofmt -w main.go
+          go test ./...
+
+      - name: Build Windows app
+        shell: bash
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags='-H=windowsgui -s -w' -o Lehr_Radar.exe .
+
+      - name: Create update manifest
+        shell: bash
+        run: |
+          SHA=$(sha256sum Lehr_Radar.exe | awk '{print $1}')
+          cat > update.json <<EOF
+          {
+            "version": "1.3.0",
+            "url": "https://raw.githubusercontent.com/omerbuyukkaymaz-maker/lehr-radar/main/Lehr_Radar.exe",
+            "sha256": "$SHA",
+            "notes": "v1.3: stability optimization, lightweight map, lower background concurrency, clearer button feedback, Gmail status sound/flash notifications and live self-update channel."
+          }
+          EOF
+
+      - name: Publish app and update feed
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add main.go market.json Lehr_Radar.exe update.json
+          git commit -m 'Publish Lehr Radar v1.3' || exit 0
+          git push
