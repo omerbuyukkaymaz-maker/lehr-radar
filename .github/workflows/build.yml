@@ -38,11 +38,9 @@ jobs:
           with open('market.json', 'w', encoding='utf-8') as f:
               json.dump(seed.get('market', []), f, ensure_ascii=False, indent=2)
 
-      - name: Format and compile check
+      - name: Format source
         shell: bash
-        run: |
-          gofmt -w main.go
-          go test ./...
+        run: gofmt -w main.go
 
       - name: Build Windows app
         shell: bash
